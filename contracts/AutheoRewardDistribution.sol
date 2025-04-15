@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.28;
+pragma solidity 0.8.28;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
@@ -17,7 +17,7 @@ contract AutheoRewardDistribution is Ownable, ReentrancyGuard, Pausable {
     uint256 public immutable totalSupply;
 
     // Constants for decimal handling
-    uint256 private immutable SCALE = 10 ** 18;
+    uint256 private constant SCALE = 1e18;
 
     // Allocation percentages (scaled by DECIMALS)
     uint256 public constant BUG_BOUNTY_ALLOCATION_PERCENTAGE = 6000; // 60%  of total supply
@@ -91,6 +91,8 @@ contract AutheoRewardDistribution is Ownable, ReentrancyGuard, Pausable {
 
     mapping(address => uint256) public lastContractDeploymentClaim;
     mapping(address => uint256) public contractDeploymentRegistrationTime;
+    // Mapping to track authorized addresses
+    mapping(address => bool) public isAuthorized;
 
     // Bug Criticality Enum
     enum BugCriticality {
@@ -101,15 +103,24 @@ contract AutheoRewardDistribution is Ownable, ReentrancyGuard, Pausable {
     }
 
     // Events
-    event WhitelistUpdated(string claimType, address indexed user, uint256 id);
-    event Claimed(string claimType, address indexed user, uint256 time);
-    event ClaimAmountUpdated(uint256 newClaimedAmount);
-    event EmergencyWithdraw(address token, uint256 amount);
-    event TestnetStatusUpdated(bool status);
-
-    event Received(address sender, uint256 amount);
+    event WhitelistUpdated(
+        string indexed claimType,
+        address indexed user,
+        uint256 indexed id
+    );
+    event Claimed(
+        string indexed claimType,
+        address indexed user,
+        uint256 indexed amount
+    );
+    event ClaimAmountUpdated(uint256 indexed newClaimedAmount);
+    event EmergencyWithdraw(address indexed token, uint256 indexed amount);
+    event TestnetStatusUpdated(bool indexed status);
+    event Received(address indexed sender, uint256 indexed amount);
+    event Withdrawal(address indexed user, uint256 indexed amount);
 
     error USER_HAS_NO_CLAIM(address user);
+    error INSUFFICIENT_BALANCE();
 
     // Modifiers
     modifier whenTestnetInactive() {
@@ -117,23 +128,32 @@ contract AutheoRewardDistribution is Ownable, ReentrancyGuard, Pausable {
         _;
     }
 
-    modifier onlyOwnerOrTestnetInactive() {
-        require(
-            owner() == msg.sender || !isTestnet,
-            "Only owner can call during testnet"
-        );
+    modifier onlyAuthorized() {
+        require(isAuthorized[msg.sender], "Unauthorized");
         _;
     }
 
-    constructor() Ownable(msg.sender) {
+    constructor(address _autheoToken) Ownable(msg.sender) {
+        require(_autheoToken != address(0), "Invalid token address");
+        Autheo = IERC20(_autheoToken);
         totalSupply = 10500000000000000000000000;
-        isTestnet = true; // Start in testnet mode
+        totalDappRewardsIds = 0;
+        totalLowBugBountyUserNumber = 0;
+        totalMediumBugBountyUserNumber = 0;
+        totalHighBugBountyUserNumber = 0;
+        dappUserCurrentId = 0;
+        contractDeployerCurrentId = 0;
+        lowBugBountyCurrentId = 0;
+        mediumBugBountyCurrentId = 0;
+        highBugBountyCurrentId = 0;
+        isTestnet = true;
+        isAuthorized[msg.sender] = true;
     }
 
-    /**
-     * @dev Toggle testnet status
-     * @param _status New testnet status
-     */
+    function setAuthorized(address _address, bool _status) external onlyOwner {
+        isAuthorized[_address] = _status;
+    }
+
     function setTestnetStatus(bool _status) external onlyOwner {
         isTestnet = _status;
         emit TestnetStatusUpdated(_status);
@@ -143,249 +163,151 @@ contract AutheoRewardDistribution is Ownable, ReentrancyGuard, Pausable {
         address payable recipient,
         uint256 amount
     ) private {
-        // Transfer native tokens using call
+        if (address(this).balance < amount) revert INSUFFICIENT_BALANCE();
         (bool success, ) = recipient.call{value: amount}("");
         require(success, "Transfer failed");
     }
 
     function setClaimPerContractDeployer(
         uint256 _claimAmount
-    ) public onlyOwner {
+    ) external onlyOwner {
         claimPerContractDeployer = _claimAmount;
         emit ClaimAmountUpdated(_claimAmount);
     }
 
-    function setClaimPerDappUser(uint256 _claimAmount) public onlyOwner {
+    function setClaimPerDappUser(uint256 _claimAmount) external onlyOwner {
         claimPerDappUser = _claimAmount;
         emit ClaimAmountUpdated(_claimAmount);
     }
 
-    /**
-     * @dev Register low criticality bug bounty users
-     * @param _lowBugBountyUsers Array of addresses for low criticality bug bounties
-     */
-
     function registerLowBugBountyUsers(
-        address[] memory _lowBugBountyUsers
+        address[] calldata _lowBugBountyUsers
     ) external onlyOwner {
         require(isTestnet, "Registration period has ended");
-
         lowBugBountyCurrentId++;
-
-        for (uint256 i = 0; i < _lowBugBountyUsers.length; ) {
-            address user = _lowBugBountyUsers[i];
-
-            require(user != address(0), "Invalid address");
-            require(
-                bugBountyCriticality[user][lowBugBountyCurrentId] ==
-                    BugCriticality.NONE,
-                "User already assigned to a criticality"
-            );
-
-            totalLowBugBountyUserNumber++;
-
-            if (!hasReward[user]) {
-                allUsers.push(user);
-            }
-
-            bugBountyCriticality[user][lowBugBountyCurrentId] = BugCriticality
-                .LOW;
-            hasReward[user] = true;
-            emit WhitelistUpdated(
-                "Low Bug Bounty",
-                user,
-                lowBugBountyCurrentId
-            );
-
-            unchecked {
-                i++;
-            }
-        }
+        _registerBugBountyUsers(
+            _lowBugBountyUsers,
+            lowBugBountyCurrentId,
+            BugCriticality.LOW,
+            "Low Bug Bounty"
+        );
     }
 
-    /**
-     * @dev Register medium criticality bug bounty users
-     * @param _mediumBugBountyUsers Array of addresses for medium criticality bug bounties
-     */
     function registerMediumBugBountyUsers(
-        address[] memory _mediumBugBountyUsers
+        address[] calldata _mediumBugBountyUsers
     ) external onlyOwner {
         require(isTestnet, "Registration period has ended");
-
         mediumBugBountyCurrentId++;
-
-        for (uint256 i = 0; i < _mediumBugBountyUsers.length; ) {
-            address user = _mediumBugBountyUsers[i];
-
-            require(user != address(0), "Invalid address");
-            require(
-                bugBountyCriticality[user][mediumBugBountyCurrentId] ==
-                    BugCriticality.NONE,
-                "User already assigned to a criticality"
-            );
-
-            totalMediumBugBountyUserNumber++;
-
-            if (!hasReward[user]) {
-                allUsers.push(user);
-            }
-
-            bugBountyCriticality[user][
-                mediumBugBountyCurrentId
-            ] = BugCriticality.MEDIUM;
-            hasReward[user] = true;
-            emit WhitelistUpdated(
-                "Medium Bug Bounty",
-                user,
-                mediumBugBountyCurrentId
-            );
-
-            unchecked {
-                i++;
-            }
-        }
+        _registerBugBountyUsers(
+            _mediumBugBountyUsers,
+            mediumBugBountyCurrentId,
+            BugCriticality.MEDIUM,
+            "Medium Bug Bounty"
+        );
     }
 
-    /**
-     * @dev Register high criticality bug bounty users
-     * @param _highBugBountyUsers Array of addresses for high criticality bug bounties
-     */
     function registerHighBugBountyUsers(
-        address[] memory _highBugBountyUsers
+        address[] calldata _highBugBountyUsers
     ) external onlyOwner {
         require(isTestnet, "Registration period has ended");
-
         highBugBountyCurrentId++;
+        _registerBugBountyUsers(
+            _highBugBountyUsers,
+            highBugBountyCurrentId,
+            BugCriticality.HIGH,
+            "High Bug Bounty"
+        );
+    }
 
-        for (uint256 i = 0; i < _highBugBountyUsers.length; ) {
-            address user = _highBugBountyUsers[i];
+    function _registerBugBountyUsers(
+        address[] calldata _users,
+        uint256 currentId,
+        BugCriticality criticality,
+        string memory claimType
+    ) private {
+        for (uint256 i = 0; i < _users.length; i++) {
+            address user = _users[i];
+            if (
+                user == address(0) ||
+                bugBountyCriticality[user][currentId] != BugCriticality.NONE
+            ) continue;
 
-            require(user != address(0), "Invalid address");
-            require(
-                bugBountyCriticality[user][highBugBountyCurrentId] ==
-                    BugCriticality.NONE,
-                "User already assigned to a criticality"
-            );
+            if (criticality == BugCriticality.LOW)
+                totalLowBugBountyUserNumber++;
+            else if (criticality == BugCriticality.MEDIUM)
+                totalMediumBugBountyUserNumber++;
+            else if (criticality == BugCriticality.HIGH)
+                totalHighBugBountyUserNumber++;
 
-            totalHighBugBountyUserNumber++;
-
-            if (!hasReward[user]) {
-                allUsers.push(user);
-            }
-
-            bugBountyCriticality[user][highBugBountyCurrentId] = BugCriticality
-                .HIGH;
+            if (!hasReward[user]) allUsers.push(user);
+            bugBountyCriticality[user][currentId] = criticality;
             hasReward[user] = true;
-            emit WhitelistUpdated(
-                "High Bug Bounty",
-                user,
-                highBugBountyCurrentId
-            );
-
-            unchecked {
-                i++;
-            }
+            emit WhitelistUpdated(claimType, user, currentId);
         }
     }
 
     function registerContractDeploymentUsers(
-        address[] memory _contractDeploymentUsers
+        address[] calldata _contractDeploymentUsers
     ) external onlyOwner {
         require(isTestnet, "Registration period has ended");
-
-        uint256 _contractDeploymentUsersLength = _contractDeploymentUsers
-            .length;
-        require(
-            _contractDeploymentUsersLength > 0,
-            "Empty contract deployment users array"
-        );
-
+        require(_contractDeploymentUsers.length > 0, "Empty array");
         contractDeployerCurrentId++;
-
-        for (uint256 i = 0; i < _contractDeploymentUsersLength; ) {
+        for (uint256 i = 0; i < _contractDeploymentUsers.length; i++) {
             address user = _contractDeploymentUsers[i];
-
-            require(user != address(0), "Invalid contract deployment address");
-            require(
-                !isWhitelistedContractDeploymentUsersForId[user][
+            if (
+                user == address(0) ||
+                isWhitelistedContractDeploymentUsersForId[user][
                     contractDeployerCurrentId
-                ],
-                "Address already registered for contract deployment"
-            );
+                ]
+            ) continue;
 
             isWhitelistedContractDeploymentUsersForId[user][
                 contractDeployerCurrentId
             ] = true;
-
-            //Register user to whitelistedContractDeploymentUsers array
             if (!iswhitelistedContractDeploymentUsers[user]) {
                 whitelistedContractDeploymentUsers.push(user);
                 iswhitelistedContractDeploymentUsers[user] = true;
             }
-
             if (!hasReward[user]) {
                 allUsers.push(user);
                 hasReward[user] = true;
             }
-
             emit WhitelistUpdated(
                 "Contract Deployment",
                 user,
                 contractDeployerCurrentId
             );
-
-            unchecked {
-                i++;
-            }
         }
     }
 
     function registerDappUsers(
-        address[] memory _dappRewardsUsers,
-        bool[] memory _userUptime
+        address[] calldata _dappRewardsUsers,
+        bool[] calldata _userUptime
     ) external onlyOwner {
         require(isTestnet, "Registration period has ended");
-
-        uint256 _dappRewardsUsersLength = _dappRewardsUsers.length;
         require(
-            _userUptime.length == _dappRewardsUsersLength,
-            "Users must be equal length"
+            _dappRewardsUsers.length == _userUptime.length &&
+                _dappRewardsUsers.length > 0,
+            "Invalid input"
         );
-        require(_dappRewardsUsersLength > 0, "Empty dapp rewards users array");
-
-        // Increment ID for new registration period
         dappUserCurrentId++;
-
-        for (uint256 i = 0; i < _dappRewardsUsersLength; i++) {
+        for (uint256 i = 0; i < _dappRewardsUsers.length; i++) {
             address user = _dappRewardsUsers[i];
+            if (
+                user == address(0) ||
+                isWhitelistedDappUsersForId[user][dappUserCurrentId]
+            ) continue;
 
-            require(user != address(0), "Invalid dapp rewards address");
-            // Check for duplicates in current registration period
-            require(
-                !isWhitelistedDappUsersForId[user][dappUserCurrentId],
-                "Address already registered for this period"
-            );
-
-            // Set uptime if applicable
-            if (_userUptime[i]) {
-                hasGoodUptime[user] = true;
-            }
-
-            // Register for current period
+            if (_userUptime[i]) hasGoodUptime[user] = true;
             isWhitelistedDappUsersForId[user][dappUserCurrentId] = true;
-
-            //Register user to whitelistedDappRewardUsers array
             if (!iswhitelistedDappRewardUsers[user]) {
                 whitelistedDappRewardUsers.push(user);
                 iswhitelistedDappRewardUsers[user] = true;
             }
-
-            // Add to allUsers if first time receiving any reward
             if (!hasReward[user]) {
                 allUsers.push(user);
                 hasReward[user] = true;
             }
-
             emit WhitelistUpdated("Dapp Users", user, dappUserCurrentId);
         }
     }
@@ -397,130 +319,76 @@ contract AutheoRewardDistribution is Ownable, ReentrancyGuard, Pausable {
         bool _contractDeploymentClaim,
         bool _dappUserClaim,
         bool _bugBountyClaim
-    ) external nonReentrant whenNotPaused whenTestnetInactive {
-        // Ensure that claims can only be made after the testnet ends
-        require(!isTestnet, "Claims are only allowed after the testnet ends");
-
-        if (_contractDeploymentClaim) {
-            __contractDeploymentClaim(msg.sender);
-        } else if (_dappUserClaim) {
-            __claimDappRewards(msg.sender);
-        } else if (_bugBountyClaim) {
-            __bugBountyClaim(msg.sender);
-        } else {
-            revert USER_HAS_NO_CLAIM(msg.sender);
-        }
+    ) external nonReentrant whenNotPaused whenTestnetInactive onlyAuthorized {
+        if (_contractDeploymentClaim) __contractDeploymentClaim(msg.sender);
+        else if (_dappUserClaim) __claimDappRewards(msg.sender);
+        else if (_bugBountyClaim) __bugBountyClaim(msg.sender);
+        else revert USER_HAS_NO_CLAIM(msg.sender);
     }
 
     function __bugBountyClaim(address _user) private {
-        //check if user already claimed
+        require(!isBugBountyUsersClaimed[_user], "Already claimed");
         require(
-            !isBugBountyUsersClaimed[_user],
-            "User already claimed rewards"
+            totalLowBugBountyUserNumber > 0 &&
+                totalMediumBugBountyUserNumber > 0 &&
+                totalHighBugBountyUserNumber > 0,
+            "No users registered"
         );
 
-        //calculate total amount allocated to BugBunty users
         uint256 totalBugBountyAllocation = (totalSupply *
             BUG_BOUNTY_ALLOCATION_PERCENTAGE) / MAX_BPS;
+        lowRewardPerUser = totalLowBugBountyUserNumber > 0
+            ? ((totalBugBountyAllocation * LOW_PERCENTAGE) / 10000) /
+                totalLowBugBountyUserNumber
+            : 0;
+        mediumRewardPerUser = totalMediumBugBountyUserNumber > 0
+            ? ((totalBugBountyAllocation * MEDIUM_PERCENTAGE) / 10000) /
+                totalMediumBugBountyUserNumber
+            : 0;
+        highRewardPerUser = totalHighBugBountyUserNumber > 0
+            ? ((totalBugBountyAllocation * HIGH_PERCENTAGE) / 10000) /
+                totalHighBugBountyUserNumber
+            : 0;
 
-        //calculate lowBugBounty amount per user
-        lowRewardPerUser =
-            ((totalBugBountyAllocation * LOW_PERCENTAGE) / 10000) /
-            totalLowBugBountyUserNumber;
-
-        //calculate mediumBugBounty amount per user
-        mediumRewardPerUser =
-            ((totalBugBountyAllocation * MEDIUM_PERCENTAGE) / 10000) /
-            totalMediumBugBountyUserNumber;
-
-        //calculate highBugBounty amount per user
-        highRewardPerUser =
-            ((totalBugBountyAllocation * HIGH_PERCENTAGE) / 10000) /
-            totalHighBugBountyUserNumber;
-
-        //initiate total number of registering
-        uint256 numOfRegistering;
-
-        if (lowBugBountyCurrentId > numOfRegistering)
-            numOfRegistering = lowBugBountyCurrentId;
-        if (mediumBugBountyCurrentId > numOfRegistering)
-            numOfRegistering = mediumBugBountyCurrentId;
-        if (highBugBountyCurrentId > numOfRegistering)
-            numOfRegistering = highBugBountyCurrentId;
-
+        uint256 numOfRegistering = max(
+            max(lowBugBountyCurrentId, mediumBugBountyCurrentId),
+            highBugBountyCurrentId
+        );
         uint256 totalRewardAmount;
-
         for (uint256 i = 1; i <= numOfRegistering; i++) {
-            uint256 rewardAmountForId = 0;
-
-            if (bugBountyCriticality[_user][i] == BugCriticality.LOW) {
-                rewardAmountForId = lowRewardPerUser;
-            } else if (
-                bugBountyCriticality[_user][i] == BugCriticality.MEDIUM
-            ) {
-                rewardAmountForId = mediumRewardPerUser;
-            } else if (bugBountyCriticality[_user][i] == BugCriticality.HIGH) {
-                rewardAmountForId = highRewardPerUser;
-            }
-
-            totalRewardAmount += rewardAmountForId;
+            if (bugBountyCriticality[_user][i] == BugCriticality.LOW)
+                totalRewardAmount += lowRewardPerUser;
+            else if (bugBountyCriticality[_user][i] == BugCriticality.MEDIUM)
+                totalRewardAmount += mediumRewardPerUser;
+            else if (bugBountyCriticality[_user][i] == BugCriticality.HIGH)
+                totalRewardAmount += highRewardPerUser;
         }
 
         isBugBountyUsersClaimed[_user] = true;
-
         totalBugBountyRewardsClaimed += totalRewardAmount;
-
-        //check total BugBounty User Rewards exceed to the 30 % of total supply
         require(
-            totalBugBountyRewardsClaimed <=
-                (totalSupply * BUG_BOUNTY_ALLOCATION_PERCENTAGE) / MAX_BPS,
-            "exceed total reward amount allocated to Bug Bounty users"
+            totalBugBountyRewardsClaimed <= totalBugBountyAllocation,
+            "Exceeds allocation"
         );
-
         transferNativeToken(payable(_user), totalRewardAmount);
-
         emit Claimed("Bug Bounty", _user, totalRewardAmount);
     }
 
     function __contractDeploymentClaim(address _user) private {
-        // Check if user is whitelisted for deployment rewards
+        uint256 actingMonths = getCurrentDeploymentMultiplier(_user);
+        require(actingMonths > 0, "User not eligible");
+        require(!isContractDeploymentUsersClaimed[_user], "Already claimed");
 
-        uint256 actingMonths;
-
-        for (uint256 i = 1; i <= contractDeployerCurrentId; i++) {
-            if (isWhitelistedContractDeploymentUsersForId[_user][i])
-                actingMonths++;
-        }
-
-        require(actingMonths != 0, "User not eligible");
-
-        // Check if user has claimed before
-        require(
-            !isContractDeploymentUsersClaimed[_user],
-            "User has already claimed accumulated rewards"
-        );
-
-        // Calculate total reward
         uint256 totalReward = DEVELOPER_DEPLOYMENT_REWARD * actingMonths;
-
-        // Mark as claimed
         isContractDeploymentUsersClaimed[_user] = true;
-
-        // Track total claimed amount
         totalContractDeploymentClaimed += totalReward;
-
-        //check total Contract Deployment User Rewards exceed to the 1 % of total supply
         require(
             totalContractDeploymentClaimed <=
                 (totalSupply * DEVELOPER_REWARD_ALLOCATION_PERCENTAGE) /
                     MAX_BPS,
-            "exceed total reward amount allocated to Contract Deployment users"
+            "Exceeds allocation"
         );
-
-        // Transfer the accumulated reward
         transferNativeToken(payable(_user), totalReward);
-
-        // Emit claim event with multiplier information
         emit Claimed(
             string.concat(
                 "Contract Deployment Reward - ",
@@ -534,38 +402,22 @@ contract AutheoRewardDistribution is Ownable, ReentrancyGuard, Pausable {
 
     function __claimDappRewards(address _user) private {
         uint256 actingMonths;
-
         for (uint256 i = 1; i <= dappUserCurrentId; i++) {
             if (isWhitelistedDappUsersForId[_user][i]) actingMonths++;
         }
-
-        require(actingMonths != 0, "User not eligible");
-
-        // Check if the user has already claimed their rewards for the specified ID
-        require(!isDappUsersClaimed[_user], "Rewards already claimed");
+        require(actingMonths > 0, "User not eligible");
+        require(!isDappUsersClaimed[_user], "Already claimed");
 
         uint256 rewardAmount = MONTHLY_DAPP_REWARD * actingMonths;
-
-        // Add uptime bonus if applicable
-        if (hasGoodUptime[_user]) {
-            rewardAmount += MONTHLY_UPTIME_BONUS;
-        }
-
-        // Mark the user as having claimed their rewards
+        if (hasGoodUptime[_user]) rewardAmount += MONTHLY_UPTIME_BONUS;
         isDappUsersClaimed[_user] = true;
         totalDappRewardsClaimed += rewardAmount;
-
-        //check total Dapp User Rewards exceed to the 2 % of total supply
         require(
             totalDappRewardsClaimed <=
                 (totalSupply * DAPP_REWARD_ALLOCATION_PERCENTAGE) / MAX_BPS,
-            "exceed total reward amount allocated to Dapp users"
+            "Exceeds allocation"
         );
-
-        // Transfer the calculated reward to the user
         transferNativeToken(payable(_user), rewardAmount);
-
-        // Emit claim event with multiplier information
         emit Claimed(
             string.concat(
                 "Dapp User Reward - ",
@@ -580,7 +432,7 @@ contract AutheoRewardDistribution is Ownable, ReentrancyGuard, Pausable {
     /**
      * @dev Calculate remaining bug bounty rewards for each criticality level
      */
-    function calculateRemainingClaimedAmount() public view returns (uint256) {
+    function calculateRemainingClaimedAmount() external view returns (uint256) {
         return (totalBugBountyRewardsClaimed +
             totalContractDeploymentClaimed +
             totalDappRewardsClaimed);
@@ -609,8 +461,11 @@ contract AutheoRewardDistribution is Ownable, ReentrancyGuard, Pausable {
     }
 
     // Function to withdraw Ether from this contract
-    function withdraw() external {
-        payable(msg.sender).transfer(address(this).balance);
+    function withdraw() external onlyOwner {
+        uint256 balance = address(this).balance;
+        if (balance == 0) revert INSUFFICIENT_BALANCE();
+        payable(owner()).transfer(balance);
+        emit Withdrawal(owner(), balance);
     }
 
     // Function to get the balance of this contract
@@ -624,21 +479,16 @@ contract AutheoRewardDistribution is Ownable, ReentrancyGuard, Pausable {
      * @return uint256 The remaining amount of tokens available for contract deployment distribution
      */
     function calculateRemainingContractDeploymentReward()
-        public
+        external
         view
         returns (uint256)
     {
-        // calculate total allocation for contract deployment rewards (0.1 of total supply)
         uint256 totalDeploymentAllocation = (totalSupply *
             DEVELOPER_REWARD_ALLOCATION_PERCENTAGE) / MAX_BPS;
-
-        // Return 0 if all rewards have been claimed
-
-        if (totalContractDeploymentClaimed >= totalDeploymentAllocation) {
-            return 0;
-        }
-
-        return totalDeploymentAllocation - totalContractDeploymentClaimed;
+        return
+            totalContractDeploymentClaimed >= totalDeploymentAllocation
+                ? 0
+                : totalDeploymentAllocation - totalContractDeploymentClaimed;
     }
 
     /**
@@ -682,16 +532,13 @@ contract AutheoRewardDistribution is Ownable, ReentrancyGuard, Pausable {
     /**
      * @dev Calculate remaining dApp rewards allocation
      */
-    function calculateRemainingDappRewards() public view returns (uint256) {
-        // get the percentage of Dapp rewards from total supply
+    function calculateRemainingDappRewards() external view returns (uint256) {
         uint256 totalDappAllocation = (totalSupply *
             DAPP_REWARD_ALLOCATION_PERCENTAGE) / MAX_BPS;
-        // substite amount claimed from this percentage and return it
-        if (totalDappRewardsClaimed >= totalDappAllocation) {
-            return 0;
-        }
-
-        return totalDappAllocation - totalDappRewardsClaimed;
+        return
+            totalDappRewardsClaimed >= totalDappAllocation
+                ? 0
+                : totalDappAllocation - totalDappRewardsClaimed;
     }
 
     function getAllUsers() external view returns (address[] memory) {
@@ -700,16 +547,16 @@ contract AutheoRewardDistribution is Ownable, ReentrancyGuard, Pausable {
 
     function getCurrentDeploymentMultiplier(
         address _user
-    ) external view returns (uint256) {
+    ) public view returns (uint256) {
         uint256 actingMonths;
-
         for (uint256 i = 1; i <= contractDeployerCurrentId; i++) {
             if (isWhitelistedContractDeploymentUsersForId[_user][i])
                 actingMonths++;
         }
-
-        require(actingMonths != 0, "User not eligible");
-
         return actingMonths;
+    }
+
+    function max(uint256 a, uint256 b) private pure returns (uint256) {
+        return a >= b ? a : b;
     }
 }
